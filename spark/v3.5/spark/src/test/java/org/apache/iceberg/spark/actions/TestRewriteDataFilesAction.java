@@ -79,6 +79,7 @@ import org.apache.iceberg.deletes.PositionDeleteWriter;
 import org.apache.iceberg.encryption.EncryptedFiles;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.encryption.EncryptionKeyMetadata;
+import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -109,7 +110,6 @@ import org.apache.iceberg.util.StructLikeMap;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.internal.SQLConf;
-import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -726,13 +726,13 @@ public class TestRewriteDataFilesAction extends TestBase {
     RewriteDataFilesCommitManager util = spy(new RewriteDataFilesCommitManager(table));
 
     // Fail to commit
-    doThrow(new RuntimeException("Commit Failure")).when(util).commitFileGroups(any());
+    doThrow(new CommitFailedException("Commit Failure")).when(util).commitFileGroups(any());
 
     doReturn(util).when(spyRewrite).commitManager(table.currentSnapshot().snapshotId());
 
     assertThatThrownBy(spyRewrite::execute)
         .isInstanceOf(RuntimeException.class)
-        .hasMessage("Commit Failure");
+        .hasMessageContaining("Cannot commit rewrite");
 
     table.refresh();
 
@@ -741,6 +741,40 @@ public class TestRewriteDataFilesAction extends TestBase {
 
     shouldHaveSnapshots(table, 1);
     shouldHaveNoOrphans(table);
+    shouldHaveACleanCache(table);
+  }
+
+  @Test
+  public void testCommitFailsWithUncleanableFailure() {
+    Table table = createTable(20);
+    int fileSize = averageFileSize(table);
+
+    List<Object[]> originalData = currentData();
+
+    RewriteDataFilesSparkAction realRewrite =
+        basicRewrite(table)
+            .option(
+                RewriteDataFiles.MAX_FILE_GROUP_SIZE_BYTES, Integer.toString(fileSize * 2 + 1000));
+
+    RewriteDataFilesSparkAction spyRewrite = spy(realRewrite);
+    RewriteDataFilesCommitManager util = spy(new RewriteDataFilesCommitManager(table));
+
+    // Fail to commit with an arbitrary failure and validate that orphans are not cleaned up
+    doThrow(new RuntimeException("Arbitrary Failure")).when(util).commitFileGroups(any());
+
+    doReturn(util).when(spyRewrite).commitManager(table.currentSnapshot().snapshotId());
+
+    assertThatThrownBy(spyRewrite::execute)
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("Arbitrary Failure");
+
+    table.refresh();
+
+    List<Object[]> postRewriteData = currentData();
+    assertEquals("We shouldn't have changed the data", originalData, postRewriteData);
+
+    shouldHaveSnapshots(table, 1);
+    shouldHaveOrphans(table);
     shouldHaveACleanCache(table);
   }
 
@@ -761,12 +795,12 @@ public class TestRewriteDataFilesAction extends TestBase {
 
     // Fail groups 1, 3, and 7 during rewrite
     GroupInfoMatcher failGroup = new GroupInfoMatcher(1, 3, 7);
-    doThrow(new RuntimeException("Rewrite Failed"))
+    doThrow(new CommitFailedException("Rewrite Failed"))
         .when(spyRewrite)
         .rewriteFiles(any(), argThat(failGroup));
 
     assertThatThrownBy(spyRewrite::execute)
-        .isInstanceOf(RuntimeException.class)
+        .isInstanceOf(CommitFailedException.class)
         .hasMessage("Rewrite Failed");
 
     table.refresh();
@@ -857,8 +891,8 @@ public class TestRewriteDataFilesAction extends TestBase {
     List<Object[]> postRewriteData = currentData();
     assertEquals("We shouldn't have changed the data", originalData, postRewriteData);
 
-    // With 10 original groups and Max Commits of 3, we should have commits with 4, 4, and 2.
-    // removing 3 groups leaves us with only 2 new commits, 4 and 3
+    // With 10 original groups and max commits of 3, we have 4 groups per commit.
+    // Removing 3 groups, we are left with 4 groups and 3 groups in two commits.
     shouldHaveSnapshots(table, 3);
     shouldHaveNoOrphans(table);
     shouldHaveACleanCache(table);
@@ -885,7 +919,7 @@ public class TestRewriteDataFilesAction extends TestBase {
 
     // First and Third commits work, second does not
     doCallRealMethod()
-        .doThrow(new RuntimeException("Commit Failed"))
+        .doThrow(new CommitFailedException("Commit Failed"))
         .doCallRealMethod()
         .when(util)
         .commitFileGroups(any());
@@ -894,7 +928,7 @@ public class TestRewriteDataFilesAction extends TestBase {
 
     RewriteDataFiles.Result result = spyRewrite.execute();
 
-    // Commit 1: 4/4 + Commit 2 failed 0/4 + Commit 3: 2/2 == 6 out of 10 total groups comitted
+    // Commit 1: 4/4 + Commit 2 failed 0/4 + Commit 3: 2/2 == 6 out of 10 total groups committed
     assertThat(result.rewriteResults()).as("Should have 6 fileGroups").hasSize(6);
     assertThat(result.rewrittenBytesCount()).isGreaterThan(0L).isLessThan(dataSizeBefore);
 
@@ -904,6 +938,48 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertEquals("We shouldn't have changed the data", originalData, postRewriteData);
 
     // Only 2 new commits because we broke one
+    shouldHaveSnapshots(table, 3);
+    shouldHaveNoOrphans(table);
+    shouldHaveACleanCache(table);
+  }
+
+  @Test
+  public void testParallelPartialProgressWithMaxFailedCommits() {
+    Table table = createTable(20);
+    int fileSize = averageFileSize(table);
+
+    List<Object[]> originalData = currentData();
+
+    RewriteDataFilesSparkAction realRewrite =
+        basicRewrite(table)
+            .option(
+                RewriteDataFiles.MAX_FILE_GROUP_SIZE_BYTES, Integer.toString(fileSize * 2 + 1000))
+            .option(RewriteDataFiles.MAX_CONCURRENT_FILE_GROUP_REWRITES, "3")
+            .option(RewriteDataFiles.PARTIAL_PROGRESS_ENABLED, "true")
+            .option(RewriteDataFiles.PARTIAL_PROGRESS_MAX_COMMITS, "3")
+            .option(RewriteDataFiles.PARTIAL_PROGRESS_MAX_FAILED_COMMITS, "0");
+
+    RewriteDataFilesSparkAction spyRewrite = Mockito.spy(realRewrite);
+
+    // Fail groups 1, 3, and 7 during rewrite
+    GroupInfoMatcher failGroup = new GroupInfoMatcher(1, 3, 7);
+    doThrow(new RuntimeException("Rewrite Failed"))
+        .when(spyRewrite)
+        .rewriteFiles(any(), argThat(failGroup));
+
+    assertThatThrownBy(() -> spyRewrite.execute())
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining(
+            "1 rewrite commits failed. This is more than the maximum allowed failures of 0");
+
+    table.refresh();
+
+    List<Object[]> postRewriteData = currentData();
+    assertEquals("We shouldn't have changed the data", originalData, postRewriteData);
+
+    // With 10 original groups and max commits of 3, we have 4 groups per commit.
+    // Removing 3 groups, we are left with 4 groups and 3 groups in two commits.
+    // Adding max allowed failed commits doesn't change the number of successful commits.
     shouldHaveSnapshots(table, 3);
     shouldHaveNoOrphans(table);
     shouldHaveACleanCache(table);
@@ -1514,7 +1590,7 @@ public class TestRewriteDataFilesAction extends TestBase {
   public void testBinpackRewriteWithInvalidOutputSpecId() {
     Table table = createTable(10);
     shouldHaveFiles(table, 10);
-    Assertions.assertThatThrownBy(
+    assertThatThrownBy(
             () ->
                 actions()
                     .rewriteDataFiles(table)
@@ -1638,6 +1714,17 @@ public class TestRewriteDataFilesAction extends TestBase {
                 .orphanFileLocations())
         .as("Should not have found any orphan files")
         .isEmpty();
+  }
+
+  protected void shouldHaveOrphans(Table table) {
+    assertThat(
+            actions()
+                .deleteOrphanFiles(table)
+                .olderThan(System.currentTimeMillis())
+                .execute()
+                .orphanFileLocations())
+        .as("Should have found orphan files")
+        .isNotEmpty();
   }
 
   protected void shouldHaveACleanCache(Table table) {
